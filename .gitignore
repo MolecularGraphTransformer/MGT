@@ -1,0 +1,19 @@
+# Submission script
+*.sh
+
+# Byte-compiled / optimized / DLL Files
+__pycache__/
+*.py[cod]
+
+# C Extensions
+*.so
+
+# Output and log files
+*.out
+out/
+mgt.e*
+mgt.o*
+mgt.p*
+
+# Pycharm folder
+.idea/
