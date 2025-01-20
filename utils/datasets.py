@@ -1,4 +1,5 @@
 import csv
+import glob
 import json
 import random
 import warnings
@@ -10,7 +11,7 @@ import os.path as osp
 import dgl
 import torch.utils.data
 from dgl import load_graphs
-from pymatgen.core import Structure
+from pymatgen.core import Structure, Molecule
 
 
 class AtomInitializer(object):
@@ -84,10 +85,7 @@ def compute_bond_cosines(edges):
 class StructureDataset(torch.utils.data.Dataset):
     ''' Dataset for Molecular Graph Representations '''
 
-    def __init__(self, args, scope: int = 0, process: bool = False, random_seed: int = 123, transform=None):
-
-        assert scope in [0, 1, 2], 'Error setting scope of dataset, options are:\n 0: training and testing;\n 1: pre-training;\n 2: run'
-        self.scope = scope
+    def __init__(self, args, process: bool = False, random_seed: int = 123, transform=None):
         
         self.root = args.root
         self.random_seed = random_seed
@@ -135,62 +133,81 @@ class StructureDataset(torch.utils.data.Dataset):
         if self.transform:
             g = self.transform(g)
 
-        if self.scope == 0:
-            props = [float(x) for x in self.id_prop_data[idx][1:]]
-            props = np.array(props)
+        props = [float(x) for x in self.id_prop_data[idx][1:]]
+        props = np.array(props)
+        if props:
             return g, lg, fg, torch.tensor(props, dtype=torch.float32), cif_id
-        elif self.scope == 1:
-            return g, lg, fg
         else:
             return g, lg, fg, cif_id
-            
 
-    def _construct_graph(self, cif_id):
-        structure = Structure.from_file(osp.join(self.raw_dir, cif_id + '.cif'))
-        a, b, c = structure.lattice.abc
-        d = a ** 2 + b ** 2 + c ** 2
-        diag = d ** 0.5
+    def _construct_graph(self, file_id):
+        # Check if file exists and there are no duplicates
+        if osp.exists(osp.join(self.raw_dir, file_id)):
+            structure_path = osp.join(self.raw_dir, file_id)
+        elif glob.glob(osp.join(self.raw_dir, f'{file_id}.*')):
+            files = glob.glob(osp.join(self.raw_dir, f'{file_id}.*'))
+            if len(files) > 1:
+                warnings.warn(f'More than one file with the name {file_id} exists in the raw directory')
+                exit()
+            elif len(files) == 0:
+                warnings.warn(f'No file with the name {file_id} exists in the raw directory')
+                exit()
+            else:
+                structure_path = files[0]
+        else:
+            warnings.warn(f'No file with the name {file_id} exists in the raw directory')
+            exit()
 
-        if diag > self.periodic_radius:
-            diag = self.periodic_radius
+        # Load structure and transform into molecule if needed
+        structure = Structure.from_file(structure_path)
+        if not self.periodic:
+            structure = Molecule.from_sites(structure.sites)
 
         # Get atom features
         atom_fea = np.vstack([self.cai.get_atom_fea(structure[i].specie.number) for i in range(len(structure))])
         atom_fea = torch.Tensor(atom_fea)
 
-        # Get neighbours
-        local_nbrs = structure.get_all_neighbors(self.radius, include_index=True)
-        local_nbrs = [sorted(nbrs, key=lambda x: x[1]) for nbrs in local_nbrs]
-        if self.periodic:
-            full_nbrs = structure.get_all_neighbors(diag, include_index=True)
-        else:
-            full_nbrs = structure.sites
-
         nbr_idx, nbr_fea, nbr_disp, fc_idx, fc_coulomb = [], [], [], [], []
 
         # Get edges
-        for idx, nbr in enumerate(local_nbrs):
-            atm = structure[idx]
+        for idx, atm in enumerate(structure):
+
+            # Get Neighbours for the atom
+            if self.periodic:
+                nbr = sorted(structure.get_neighbors(atm, r=self.radius, include_index=True), key=lambda x: x[1])
+
+                a, b, c = structure.lattice.abc
+                diag = (a ** 2 + b ** 2 + c ** 2) ** 0.5
+
+                if diag > self.periodic_radius:
+                    diag = self.periodic_radius
+
+                full_nbrs = structure.get_neighbors(atm, diag, include_index=True)
+            else:
+                nbr = sorted(structure.get_neighbors(atm, r=self.radius), key=lambda x: x[1])
+                full_nbrs = structure.get_neighbors(atm, r=np.inf)
+
+            # Compile local and global edges
             if len(nbr) < 12:
                 warnings.warn('{} not find enough neighbors to build graph. '
                               'If it happens frequently, consider increase '
-                              'radius.'.format(cif_id))
+                              'radius.'.format(file_id))
                 nbr_idx.extend(list(map(lambda x: (idx, x[2]), nbr)))
                 nbr_fea.extend(list(map(lambda x: x[1], nbr)))
-                nbr_disp.extend(list(map(lambda x: x.coords - structure[idx].coords, nbr)))
+                nbr_disp.extend(list(map(lambda x: x.coords - atm.coords, nbr)))
 
-                fc_idx.extend(list(map(lambda x: (idx, x[2]), full_nbrs[idx])))
-                distances = np.array(list(map(lambda x: x[1], full_nbrs[idx])))
-                charges = np.array(list(map(lambda x: x.specie.Z * atm.specie.Z, full_nbrs[idx])))
+                fc_idx.extend(list(map(lambda x: (idx, x[2]), full_nbrs)))
+                distances = np.array(list(map(lambda x: x[1], full_nbrs)))
+                charges = np.array(list(map(lambda x: x.specie.Z * atm.specie.Z, full_nbrs)))
                 fc_coulomb.extend(charges / distances)
             else:
                 nbr_idx.extend(list(map(lambda x: (idx, x[2]), nbr[:12])))
                 nbr_fea.extend(list(map(lambda x: x[1], nbr[:12])))
                 nbr_disp.extend(list(map(lambda x: x.coords - atm.coords, nbr[:12])))
 
-                fc_idx.extend(list(map(lambda x: (idx, x[2]), full_nbrs[idx])))
-                distances = np.array(list(map(lambda x: x[1], full_nbrs[idx])))
-                charges = np.array(list(map(lambda x: x.specie.Z * atm.specie.Z, full_nbrs[idx])))
+                fc_idx.extend(list(map(lambda x: (idx, x[2]), full_nbrs)))
+                distances = np.array(list(map(lambda x: x[1], full_nbrs)))
+                charges = np.array(list(map(lambda x: x.specie.Z * atm.specie.Z, full_nbrs)))
                 fc_coulomb.extend(charges / distances)
 
         edge_idx, edge_fea, fc_index, fc_fea, edge_disp = torch.LongTensor(np.array(nbr_idx)).t().contiguous(), \

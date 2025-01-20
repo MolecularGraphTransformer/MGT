@@ -1,6 +1,9 @@
 import os
 import time
+import pathlib
 import argparse
+import warnings
+
 import numpy as np
 import os.path as osp
 
@@ -17,117 +20,70 @@ from lightning.fabric.loggers import CSVLogger
 from lightning.fabric.strategies import FSDPStrategy
 
 
-def train(args, model, train_loader, val_loader, optimizer, criterion, error_func, fabric: Fabric):    
+def train(args, model, loader, optimizer, criterion, fabric):
+    model.train()
+    optimizer.zero_grad()
+    epoch_loss = torch.zeros(2).to(fabric.local_rank)
 
-    fabric.print('-------------------- Training and Validation Started --------------------')
-    lowest_error = 1000000
-    per_epoch_times = []
-    start_time = time.time()
-    for epoch in range(args.begin_epoch, args.epochs + 1):
-        epoch_start_time = time.time()
-        epoch_loss = torch.zeros(2).to(fabric.local_rank)
+    for iteration, (g, lg, fg, target, _) in enumerate(loader):
 
-        # -------------------- TRAINING --------------------
-        model.train()
-        optimizer.zero_grad()
-        training_start_time = time.time()
-        for iteration, (g, lg, fg, target, _) in enumerate(train_loader):
+        is_accumulating = iteration % args.n_cum != 0
 
-            is_accumulating = iteration % args.n_cum != 0
+        with fabric.no_backward_sync(model, enabled=is_accumulating):
+            output, _, _, _, _ = model(g, lg, fg)
+            loss = criterion(output, target) / args.n_cum
+            fabric.backward(loss)
 
-            with fabric.no_backward_sync(model, enabled=is_accumulating):
-                output, _, _, _, _ = model(g, lg, fg)
-                loss = criterion(output, target) / args.n_cum
+        if not is_accumulating:
+            optimizer.step()
+            optimizer.zero_grad()
 
-                fabric.backward(loss)
+        # Save Loss
+        epoch_loss[0] += (loss.item() * args.n_cum)
+        epoch_loss[1] += args.batch_size
 
-            if not is_accumulating:
-                optimizer.step()
-                optimizer.zero_grad()
+    fabric.all_reduce(epoch_loss, reduce_op='sum')
+    epoch_loss = epoch_loss[0] / epoch_loss[1]
+    fabric.print('Epoch loss: %.4f' % epoch_loss)
+    return model, optimizer, epoch_loss
 
-            # Save Loss
-            epoch_loss[0] += (loss.item() * args.n_cum)
-            epoch_loss[1] += args.batch_size
-        fabric.print(f'Training time: {time.time() - training_start_time} seconds')
 
-        # -------------------- VALIDATION --------------------
-        model.eval()
-        val_loss = torch.zeros(2).to(fabric.local_rank)
-        epoch_error = torch.zeros(2).to(fabric.local_rank)
-        epoch_indiv_error = [torch.zeros(2).to(fabric.local_rank) for _ in range(args.out_dims)]
-        validation_start_time = time.time()
-        for g, lg, fg, target, _ in val_loader:
+def validate(args, model, loader, criterion, fabric):
+    model.eval()
+    epoch_error = torch.zeros(2).to(fabric.local_rank)
+    epoch_indiv_error = [torch.zeros(2).to(fabric.local_rank) for _ in range(args.out_dims)]
 
-            with torch.no_grad():
-                output, _, _, _, _ = model(g, lg, fg)
+    for g, lg, fg, target, _ in loader:
+        with torch.no_grad():
+            output, _, _, _, _ = model(g, lg, fg)
 
-            # Get overall loss and error
-            loss = criterion(output, target)
-            val_loss[0] += loss.item()
-            val_loss[1] += args.batch_size
-            error = error_func(output, target)
-            epoch_error[0] += error.item()
-            epoch_error[1] += args.batch_size
+        # Get overall loss and error
+        error = criterion(output, target)
+        epoch_error[0] += error.item()
+        epoch_error[1] += args.batch_size
 
-            # Get individual errors
-            if args.out_dims > 1:
-                targets = torch.hsplit(target, int(target.shape[1]))
-                outputs = torch.hsplit(output, int(output.shape[1]))
-                individual_errors = [error_func(outputs[i], targets[i]) for i in range(len(outputs))]
-                for i, error in enumerate(individual_errors):
-                    epoch_indiv_error[i][0] += error.item()
-                    epoch_indiv_error[i][1] += args.batch_size
-        fabric.print(f'Validation time: {time.time() - validation_start_time} seconds')
-
-        # Average errors and losses
-        fabric.all_reduce(epoch_loss, reduce_op='sum')
-        epoch_loss = epoch_loss[0]/epoch_loss[1]
-        fabric.all_reduce(val_loss, reduce_op='sum')
-        val_loss = val_loss[0]/val_loss[1]
-        fabric.all_reduce(epoch_error, reduce_op='sum')
-        epoch_error = epoch_error[0]/epoch_error[1]
+        # Get individual errors
         if args.out_dims > 1:
-            for i, error in enumerate(epoch_indiv_error):
-                error = fabric.all_reduce(error, reduce_op='sum')
-                epoch_indiv_error[i] = error[0]/error[1]
+            targets = torch.hsplit(target, int(target.shape[1]))
+            outputs = torch.hsplit(output, int(output.shape[1]))
+            individual_errors = [criterion(outputs[i], targets[i]) for i in range(len(outputs))]
+            for i, error in enumerate(individual_errors):
+                epoch_indiv_error[i][0] += error.item()
+                epoch_indiv_error[i][1] += args.batch_size
 
-        per_epoch_time = time.time() - epoch_start_time
-        per_epoch_times.append(per_epoch_time)
+    fabric.all_reduce(epoch_error, reduce_op='sum')
+    epoch_error = epoch_error[0] / epoch_error[1]
+    if args.out_dims > 1:
+        for i, error in enumerate(epoch_indiv_error):
+            error = fabric.all_reduce(error, reduce_op='sum')
+            epoch_indiv_error[i] = error[0] / error[1]
 
-        # Print results
-        fabric.print('Epoch %d of %d with %.2f s' % (epoch, args.epochs, per_epoch_time))
-        fabric.print('Epoch loss: %.4f \\ Validation loss: %.4f \\ Validation error: %.4f' % (epoch_loss, val_loss, epoch_error))
-        if args.out_dims > 1:
-            errors_str = ''
-            for i in range(args.out_dims):
-                errors_str += str(f'{args.out_names[i]} Error: {epoch_indiv_error[i]}')
-                if i + 1 != args.out_dims:
-                    errors_str += ' | '
-            fabric.print(errors_str)
-
-        # Log results
-        results = {
-            'Train Loss': epoch_loss,
-            'Validation Loss': val_loss,
-            'Validation Error': epoch_error,
-        }
-        if args.out_dims > 1:
-            for i in range(args.out_dims):
-                results[f'{args.out_names[i]} Error'] = epoch_indiv_error[i]
-        fabric.log_dict(results, step=epoch)
-
-        # Save best performing model
-        if epoch_error < lowest_error:
-            lowest_error = epoch_error
-
-            state = {'model': model, 'optimizer': optimizer}
-            fabric.save(osp.join(args.model_path, args.lowest_model), state)
-
-    fabric.print(f'Average per epoch time: {np.mean(per_epoch_times)} seconds, Total {args.epochs} epochs time: {time.time() - start_time} seconds')
-    fabric.print('-------------------- Training Finished --------------------')
-
-    state = {'model': model, 'optimizer': optimizer}
-    fabric.save(osp.join(args.model_path, args.final_model), state)
+    error_str = 'Validation error: %.4f' % epoch_error
+    if args.out_dims > 1:
+        for i in range(args.out_dims):
+            error_str += str(f' | {args.out_names[i]} Error: {epoch_indiv_error[i]}')
+    fabric.print(error_str)
+    return epoch_error, epoch_indiv_error
 
 
 def main(args):
@@ -137,51 +93,108 @@ def main(args):
 
     # ------------------------------------- FABRIC SETUP -------------------------------------
     logger = CSVLogger(
-        root_dir='/jmain02/home/J2AD007/txk101/mxa59-txk101/python_scripts/FSDP/outputs/train/extensive', 
+        root_dir=args.save_dir,
         name=args.run_name,
         flush_logs_every_n_steps=1
     )
     policy = {encoder, EdgeGatedGraphConv, multiheaded}
     fsdp_strategy = FSDPStrategy(auto_wrap_policy=policy, activation_checkpointing_policy=policy, state_dict_type='full')
-    fabric = Fabric(accelerator=args.accelerator, devices=args.n_devices, num_nodes=args.n_nodes, strategy=fsdp_strategy, loggers=logger)
+    if args.accelerator == 'cpu' or args.accelerator == 'mps':
+        fabric = Fabric(accelerator=args.accelerator, devices=args.n_devices, num_nodes=args.n_nodes, loggers=logger)
+    elif args.accelerator == 'gpu' or args.accelerator == 'cuda':
+        fabric = Fabric(accelerator=args.accelerator, devices=args.n_devices, num_nodes=args.n_nodes, strategy=fsdp_strategy, loggers=logger)
+    else:
+        fabric = Fabric(accelerator='auto', devices=args.n_devices, num_nodes=args.n_nodes, loggers=logger)
     fabric.launch()
 
     # ------------------------------------- DATASET SETUP -------------------------------------
-    dataset = StructureDataset(args)
+    dataset = StructureDataset(args, process=args.process)
     training_data, validation_data = torch.utils.data.random_split(dataset, [args.train_split, args.val_split])
     training_loader = DataLoader(training_data, collate_fn=dataset.collate_tt, batch_size=args.batch_size, shuffle=True)
     validation_loader = DataLoader(validation_data, collate_fn=dataset.collate_tt, batch_size=args.batch_size, shuffle=True)
-    training_loader, validation_loader = fabric.setup_dataloaders(training_loader), fabric.setup_dataloaders(validation_loader)    
+    training_loader, validation_loader = fabric.setup_dataloaders(training_loader), fabric.setup_dataloaders(validation_loader)
 
     # ------------------------------------- MODEL, OPTIMIZER AND LOSS/ERROR FUNCTION SETUP -------------------------------------
     model = Graphformer(args=args)
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
     num_params = sum(p.numel() for p in model_parameters)
-    fabric.print(f'ARCHITECTURE: \n    Layers - {args.num_layers} \n    MHAs - {args.n_mha} \n    ALIGNNs - {args.n_alignn} \n    GNNs - {args.n_gnn} \n    Parameters - {num_params} ')
+    fabric.print(f'ARCHITECTURE: \n'
+                 f'\tLayers - {args.num_layers} \n'
+                 f'\tMHAs - {args.n_mha} \n'
+                 f'\tALIGNNs - {args.n_alignn} \n'
+                 f'\tGNNs - {args.n_gnn} \n'
+                 f'\tParameters - {num_params}')
 
     if args.load_model == 1:
-        fabric.print('Pre-Training not yet implemented')
+        warnings.warn('Pre-Training Strategy not yet Implemented')
         exit()
         # model.freeze_train()
 
     model = fabric.setup_module(model)
-    
+
     optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, weight_decay=args.decay)
     optimizer = fabric.setup_optimizers(optimizer)
 
-    # if args.load_model == 1:
-    #     pretrain_path = osp.join(args.model_path, args.pretrain_model)
-    #     state_dicts = fabric.load(pretrain_path)
-    #     model.load_state_dict(state_dicts['model'])
-    if args.load_model == 2:
-        state = {'model': model, 'optimizer': optimizer}
-        lowest_model = osp.join(args.model_path, args.lowest_model)
-        fabric.load(lowest_model, state)
+    if args.load_model == 1:
+        pretrain_path = osp.join(args.model_path, args.pretrain_model)
+        assert osp.exists(pretrain_path), f'No model save as {args.pretrain_model} exists in path {str(args.model_path)}'
+        state_dicts = {'models': model}
+        fabric.load(pretrain_path, state=state_dicts)
+    elif args.load_model == 2:
+        lowest_path = osp.join(args.model_path, args.lowest_model)
+        assert osp.exists(lowest_path), f'No model save as {args.lowest_model} exists in path {str(args.model_path)}'
+        state_dicts = {'models': model, 'optimizer': optimizer}
+        fabric.load(lowest_path, state=state_dicts)
 
-    criterion = nn.MSELoss()
-    error_func = nn.L1Loss()
+    train_loss = nn.MSELoss()
+    val_loss = nn.L1Loss()
 
-    train(args, model, training_loader, validation_loader, optimizer, criterion, error_func, fabric)
+    # -------------------------------- TRAINING AND VALIDATION --------------------------------
+    fabric.print('-------------------- Training and Validation Started --------------------')
+    lowest_error = 1000000
+    per_epoch_times = []
+    start_time = time.time()
+
+    for epoch in range(args.begin_epoch, args.epochs + 1):
+        # -------------------- TRAINING --------------------
+        training_start_time = time.time()
+        model, optimizer, epoch_loss = train(args, model, training_loader, optimizer, train_loss, fabric)
+        fabric.print(f'Training time: {time.time() - training_start_time} seconds')
+
+        # ------------------- VALIDATION -------------------
+        validation_start_time = time.time()
+        epoch_error, epoch_indiv_error = validate(args, model, validation_loader, val_loss, fabric)
+        fabric.print(f'Validation time: {time.time() - validation_start_time} seconds')
+
+        # ------------------- LOG RESULTS ------------------
+        per_epoch_time = time.time() - training_start_time
+        per_epoch_times.append(per_epoch_time)
+        fabric.print('Completed Epoch %d of %d in %.2f s' % (epoch, args.epochs, per_epoch_time))
+
+        results = {'Train Loss': epoch_loss, 'Validation Error': epoch_error}
+        if args.out_dims > 1:
+            for i in range(args.out_dims):
+                results[f'{args.out_names[i]} Error'] = epoch_indiv_error[i]
+        fabric.log_dict(results, step=epoch)
+
+        # ------------- SAVE LOWEST ERROR MODEL ------------
+        if epoch_error < lowest_error:
+            lowest_error = epoch_error
+            state = {'models': model, 'optimizer': optimizer}
+            fabric.save(osp.join(args.model_path, args.lowest_model), state)
+
+        # ------------------- VISUALIZE -------------------
+        if epoch % 10 == 0 or epoch == 1:
+            model.eval()
+            g, lg, fg, target, _ = next(iter(validation_loader))
+            with torch.no_grad():
+                output, _, _, _, _ = model(g, lg, fg, visualise=True)
+
+    fabric.print(f'Average per epoch time: {np.mean(per_epoch_times)} seconds, Total {args.epochs} epochs time: {time.time() - start_time} seconds')
+    fabric.print('-------------------- Training and Validation Finished --------------------')
+
+    state = {'models': model, 'optimizer': optimizer}
+    fabric.save(osp.join(args.model_path, args.final_model), state)
 
 
 if __name__ == "__main__":
@@ -189,7 +202,7 @@ if __name__ == "__main__":
     # Fabric Arguments
     parser.add_argument('--n_devices', type=int, default=8, help='number of gpus/cpus that the code has access to (default: 8)')
     parser.add_argument('--n_nodes', type=int, default=1, help='number of nodes/computers on which the model is being trained (default: 1)')
-    parser.add_argument('--accelerator', type=str, default='cuda', choices=['cpu', 'gpu', 'mps', 'cuda', 'tpu'], 
+    parser.add_argument('--accelerator', type=str, default='cuda', choices=['cpu', 'gpu', 'mps', 'cuda', 'tpu'],
                         help='device type on which the training is happening [cpu, gpu, mps (apple M1/M2 only), cuda (NVIDIA GPUs only), tpu] (default: cuda)')
     # Save and Load Arguments
     parser.add_argument('--root', type=str, help='root directory for all datasets (default: None)', required=True)
@@ -204,13 +217,14 @@ if __name__ == "__main__":
     # Training Arguments
     parser.add_argument('--n_cum', type=int, default=8, help='number of batches to accumulate the error for')
     parser.add_argument('--batch_size', type=int, default=2, help='batch size for training (default: 2)')
-    parser.add_argument('--train_split', type=int, help='number of items in dataset to be used for training', required=True)
-    parser.add_argument('--val_split', type=int, help='number of items in dataset to be used for validation', required=True)
+    parser.add_argument('--train_split', type=float, default=0.8, help='number of items in dataset to be used for training (default: 0.8)')
+    parser.add_argument('--val_split', type=float, default=0.2, help='number of items in dataset to be used for validation (default: 0.2)')
     parser.add_argument('--epochs', type=int, default=100, help='number of epochs to train for (default: 100)')
     parser.add_argument('--begin_epoch', type=int, default=1, help='set to restart training from a specific epoch')
     parser.add_argument('--lr', type=float, default=0.0001, help='learning rate (default: 0.0001)')
     parser.add_argument('--decay', type=float, default=1e-5, help='weight decay for the optimizers (default: 1e-5)')
     # Model and Dataset Arguments
+    parser.add_argument('--process', type=int, default=1, choices=[0, 1], help='whether the graphs for the structures/molecules need to be created during dataset loading (default: True)')
     parser.add_argument('--max_nei_num', type=int, default=12, help='maximum number of neighbour allowed for each atom in the local graph (default: 12)')
     parser.add_argument('--local_radius', type=int, default=8, help='radius used to form the local graph (default: 8)')
     parser.add_argument('--periodic', type=int, default=1, choices=[0, 1], help='whether the input structure is a periodic structure or not (default: True)')
@@ -232,7 +246,7 @@ if __name__ == "__main__":
     parser.add_argument('--n_gnn', type=int, default=2, help='number of graph convolutions in each encoder (default: 2)')
     parser.add_argument('--n_heads', type=int, default=4, help='number of attention heads (default: 4)')
     parser.add_argument('--residual', type=int, default=1, choices=[0, 1], help='whether to add residuality to the network or not (default: True)')
-    
+
     args = parser.parse_args()
 
     if args.out_names is None:
@@ -242,11 +256,13 @@ if __name__ == "__main__":
     assert len(args.out_names) == args.out_dims, 'number of outputs and output names not the same'
     args.residual = bool(args.residual)
     args.periodic = bool(args.periodic)
+    args.process = bool(args.process)
 
     if args.save_dir is None:
         args.save_dir = osp.join(os.getcwd(), 'output', 'train')
         if not osp.exists(args.save_dir):
-            os.mkdir(args.save_dir)
+            directory = pathlib.Path(args.save_dir)
+            directory.mkdir(parents=True, exist_ok=True)
 
     if args.run_name is None:
         args.run_name = f'{args.num_layers}_{args.n_mha}_{args.n_alignn}_{args.n_gnn}'

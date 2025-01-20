@@ -11,6 +11,7 @@ __pycache__/
 # Output and log files
 *.out
 out/
+output/
 mgt.e*
 mgt.o*
 mgt.p*

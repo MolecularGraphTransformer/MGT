@@ -1,8 +1,7 @@
-import argparse
 import os
 import time
-import numpy as np
-import pandas as pd
+import pathlib
+import argparse
 import os.path as osp
 
 from model.transformer import multiheaded
@@ -16,6 +15,7 @@ from lightning.fabric import Fabric
 from dgl.dataloading import GraphDataLoader
 from lightning.fabric.loggers import CSVLogger
 from lightning.fabric.strategies import FSDPStrategy
+
 
 def test(args, model, loader, fabric: Fabric):
 
@@ -55,7 +55,7 @@ def main(args):
     fabric.launch()
 
     # ------------------------------------- DATASET SETUP -------------------------------------
-    data = StructureDataset(args, scope=2)
+    data = StructureDataset(args, process=args.process)
     testing_loader = GraphDataLoader(data, collate_fn=data.collate_run, batch_size=1, shuffle=True)
     testing_loader = fabric.setup_dataloaders(testing_loader)
 
@@ -88,6 +88,7 @@ if __name__ == "__main__":
     parser.add_argument('--model_name', type=str, default='lowest_model.ckpt', help='name of the model to load')
     parser.add_argument('--out_names', nargs='+', type=str, default=None, help='names of the outputs [for logging purposes only]')
     # Model and Dataset Arguments
+    parser.add_argument('--process', type=int, default=1, choices=[0, 1], help='whether the graphs for the structures/molecules need to be created during dataset loading (default: True)')
     parser.add_argument('--max_nei_num', type=int, default=12, help='maximum number of neighbour allowed for each atom in the local graph (default: 12)')
     parser.add_argument('--local_radius', type=int, default=8, help='radius used to form the local graph (default: 8)')
     parser.add_argument('--periodic', type=int, default=1, choices=[0, 1], help='whether the input structure is a periodic structure or not (default: True)')
@@ -119,11 +120,13 @@ if __name__ == "__main__":
     assert len(args.out_names) == args.out_dims, 'number of outputs and output names not the same'
     args.residual = bool(args.residual)
     args.periodic = bool(args.periodic)
+    args.process = bool(args.process)
 
     if args.save_dir is None:
         args.save_dir = osp.join(os.getcwd(), 'output', 'run')
         if not osp.exists(args.save_dir):
-            os.mkdir(args.save_dir)
+            directory = pathlib.Path(args.save_dir)
+            directory.mkdir(parents=True, exist_ok=True)
     
     if args.run_name is None:
         args.run_name = f'{args.num_layers}_{args.n_mha}_{args.n_alignn}_{args.n_gnn}'
