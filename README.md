@@ -35,7 +35,7 @@ Now install the necessary libraries into the environment:
 
 - [Pytorch](https://pytorch.org/)
 ```
-conda install pytorch torchvision torchaudio pytorch-cuda=11.8 -c pytorch -c nvidia
+conda install pytorch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 pytorch-cuda=12.4 -c pytorch -c nvidia
 ```
 
 - [Fabric](https://lightning.ai/docs/fabric/stable/)
@@ -45,7 +45,7 @@ conda install lightning -c conda-forge
 
 - [Deep Graph Library](https://www.dgl.ai/)
 ```
-conda install dgl -c dglteam
+conda install -c dglteam/label/th24_cu124 dgl
 ```
 
 - [Pymatgen](https://pymatgen.org/)
@@ -96,19 +96,19 @@ To train your own model you'll first need to have made a [custom dataset](#-data
 then run the training and validation by running:
 
 ```
-training.py --root ./examples/example_data/ --model_path ./saved_models/
+python training.py --root ./examples/example_data/ --model_path ./saved_models/
 ```
 
 You can specify the train and validation splits of the dataset by running:
 
 ```
-training.py --root ./examples/example_data/ --model_path ./saved_models/ --train_split 0.8 --val_split 0.2 
+python training.py --root ./examples/example_data/ --model_path ./saved_models/ --train_split 0.8 --val_split 0.2 
 ```
 
 or the splits can also be set as absolute values (example assumes a dataset with 100 systems)
 
 ```
-training.py --root ./examples/example_data/ --model_path ./saved_models/ --train_split 80 --val_split 20
+python training.py --root ./examples/example_data/ --model_path ./saved_models/ --train_split 80 --val_split 20
 ```
 
 after running the [training.py](training.py) file, you will obtain:
@@ -128,7 +128,7 @@ To test your own model you'll first need to have made a [custom dataset](#-datas
 then run the testing by running:
 
 ```
-testing.py --root ./examples/example_data/ --model_path ./saved_models/ --model_name model.ckpt
+python testing.py --root ./examples/example_data/ --model_path ./saved_models/ --model_name model.ckpt
 ```
 
 after running the [testing.py](testing.py) file, you will obtain:
