@@ -130,10 +130,10 @@ if __name__ == "__main__":
     parser.add_argument('--embedding_dims', type=int, default=128, help='dimension of embedding layer (default: 128)')
     parser.add_argument('--hidden_dims', type=int, default=512, help='dimensions of each hidden layer (default: 512)')
     parser.add_argument('--out_dims', type=int, default=3, help='length of output vector of the network (default: 3)')
-    parser.add_argument('--num_layers', type=int, default=3, help='number of encoders in the network (default: 3)')
+    parser.add_argument('--num_layers', type=int, default=1, help='number of encoders in the network (default: 1)')
     parser.add_argument('--n_mha', type=int, default=1, help='number of attention layers in each encoder (default: 1)')
-    parser.add_argument('--n_alignn', type=int, default=2, help='number of graph convolutions in each encoder (default: 2)')
-    parser.add_argument('--n_gnn', type=int, default=2, help='number of graph convolutions in each encoder (default: 2)')
+    parser.add_argument('--n_alignn', type=int, default=3, help='number of graph convolutions in each encoder (default: 3)')
+    parser.add_argument('--n_gnn', type=int, default=3, help='number of graph convolutions in each encoder (default: 3)')
     parser.add_argument('--n_heads', type=int, default=4, help='number of attention heads (default: 4)')
     parser.add_argument('--residual', type=int, default=1, choices=[0, 1], help='whether to add residuality to the network or not (default: True)')
 

@@ -97,5 +97,3 @@ class multiheaded(nn.Module):
             y = m + edge_feats
 
         return x, y
-
-
