@@ -2,41 +2,52 @@ import os
 import time
 import pathlib
 import argparse
-import warnings
 
+import dgl
+import torch
 import numpy as np
 import os.path as osp
+import torch.nn as nn
+import torch.optim as optim
 
 from model.transformer import multiheaded
 from model.alignn import EdgeGatedGraphConv
 from model.graphformer import Graphformer, encoder
 from utils.datasets import StructureDataset
+from utils.masker import MaskAtom
 
-import torch
-import torch.nn as nn
+from torch.nn import Linear
 from lightning.fabric import Fabric
 from torch.utils.data import DataLoader
 from lightning.fabric.loggers import CSVLogger
 from lightning.fabric.strategies import FSDPStrategy
 
 
-def train(args, model, loader, optimizer, criterion, fabric):
-    model.train()
-    optimizer.zero_grad()
+def pre_train(args, loader, main_model, atom_model, main_optim, atom_optim, criterion, fabric: Fabric):
+    main_model.train(), atom_model.train()
+    main_optim.zero_grad(), atom_optim.zero_grad()
     epoch_loss = torch.zeros(2).to(fabric.local_rank)
 
-    for iteration, (g, lg, fg, target, _) in enumerate(loader):
+    for iteration, (graphs, lg, fg, _) in enumerate(loader):
 
         is_accumulating = iteration % args.n_cum != 0
 
-        with fabric.no_backward_sync(model, enabled=is_accumulating):
-            output, _, _, _, _ = model(g, lg, fg)
-            loss = criterion(output, target) / args.n_cum
+        g = graphs[0]
+        nsg = graphs[1]
+        node_idxs = nsg.ndata[dgl.NID].tolist()
+        node_truths = nsg.ndata['node_feats']
+
+        with fabric.no_backward_sync(main_model, enabled=is_accumulating), fabric.no_backward_sync(atom_model, enabled=is_accumulating):
+            _, node_rep, _, _, _ = main_model(g, lg, fg)
+            pred_node = atom_model(node_rep[node_idxs])
+            loss = criterion(pred_node, node_truths)
             fabric.backward(loss)
 
         if not is_accumulating:
-            optimizer.step()
-            optimizer.zero_grad()
+            main_optim.step()
+            main_optim.zero_grad()
+            atom_optim.step()
+            atom_optim.zero_grad()
 
         # Save Loss
         epoch_loss[0] += (loss.item() * args.n_cum)
@@ -45,45 +56,43 @@ def train(args, model, loader, optimizer, criterion, fabric):
     fabric.all_reduce(epoch_loss, reduce_op='sum')
     epoch_loss = epoch_loss[0] / epoch_loss[1]
     fabric.print('Epoch loss: %.4f' % epoch_loss)
-    return model, optimizer, epoch_loss
+    return main_model, atom_model, main_optim, atom_optim, epoch_loss
 
 
-def validate(args, model, loader, criterion, fabric):
-    model.eval()
-    epoch_error = torch.zeros(2).to(fabric.local_rank)
-    epoch_indiv_error = [torch.zeros(2).to(fabric.local_rank) for _ in range(args.out_dims)]
+def validate(args, loader, main_model, atom_model, criterion, fabric):
+    main_model.eval(), atom_model.eval()
+    epoch_loss = torch.zeros(2).to(fabric.local_rank)
+    epoch_matches = torch.empty(0).to(fabric.local_rank)
 
-    for g, lg, fg, target, _ in loader:
+    for graphs, lg, fg, _ in loader:
+
+        g = graphs[0]
+        nsg = graphs[1]
+        node_idxs = nsg.ndata[dgl.NID].tolist()
+        node_truths = nsg.ndata['node_feats']
+
         with torch.no_grad():
-            output, _, _, _, _ = model(g, lg, fg)
+            _, node_rep, _, _, _ = main_model(g, lg, fg)
+            pred_node = atom_model(node_rep[node_idxs])
+            loss = criterion(pred_node, node_truths)
 
-        # Get overall loss and error
-        error = criterion(output, target)
-        epoch_error[0] += error.item()
-        epoch_error[1] += args.batch_size
+        # Save Loss
+        epoch_loss[0] += (loss.item() * args.n_cum)
+        epoch_loss[1] += args.batch_size
 
-        # Get individual errors
-        if args.out_dims > 1:
-            targets = torch.hsplit(target, int(target.shape[1]))
-            outputs = torch.hsplit(output, int(output.shape[1]))
-            individual_errors = [criterion(outputs[i], targets[i]) for i in range(len(outputs))]
-            for i, error in enumerate(individual_errors):
-                epoch_indiv_error[i][0] += error.item()
-                epoch_indiv_error[i][1] += args.batch_size
+        # Get accuracy of current iteration
+        pred_atoms = (torch.sigmoid(pred_node) > 0.5).float()
+        correct_atoms = torch.all(pred_atoms == node_truths, dim=1)
+        epoch_matches = torch.cat((epoch_matches, correct_atoms), dim=0)
 
-    fabric.all_reduce(epoch_error, reduce_op='sum')
-    epoch_error = epoch_error[0] / epoch_error[1]
-    if args.out_dims > 1:
-        for i, error in enumerate(epoch_indiv_error):
-            error = fabric.all_reduce(error, reduce_op='sum')
-            epoch_indiv_error[i] = error[0] / error[1]
+    # Get overall accuracy accross all iterations
+    accuracy = epoch_matches.to(torch.float32).mean()
+    fabric.print(f'Validation accuracy: {accuracy}')
 
-    error_str = 'Validation error: %.4f' % epoch_error
-    if args.out_dims > 1:
-        for i in range(args.out_dims):
-            error_str += str(f' | {args.out_names[i]} Error: {epoch_indiv_error[i]}')
-    fabric.print(error_str)
-    return epoch_error, epoch_indiv_error
+    # Get overall loss and return it
+    fabric.all_reduce(epoch_loss, reduce_op='sum')
+    epoch_loss = epoch_loss[0] / epoch_loss[1]
+    return epoch_loss, accuracy
 
 
 def main(args):
@@ -108,97 +117,79 @@ def main(args):
     fabric.launch()
 
     # ------------------------------------- DATASET SETUP -------------------------------------
-    dataset = StructureDataset(args, process=args.process)
-    training_data, validation_data = torch.utils.data.random_split(dataset, [args.train_split, args.val_split])
-    training_loader = DataLoader(training_data, collate_fn=dataset.collate_tt, batch_size=args.batch_size, shuffle=True)
-    validation_loader = DataLoader(validation_data, collate_fn=dataset.collate_tt, batch_size=args.batch_size, shuffle=True)
+    data = StructureDataset(args, transform=MaskAtom(
+        num_atom_fea=args.num_atom_fea, node_feat_name='node_feats', mask_rate=args.mask_rate
+    ))
+    training_data, validation_data = torch.utils.data.random_split(data, [args.train_split, args.val_split])
+    training_loader = DataLoader(training_data, collate_fn=data.collate_pre, batch_size=args.batch_size, shuffle=True)
+    validation_loader = DataLoader(validation_data, collate_fn=data.collate_pre, batch_size=args.batch_size, shuffle=True)
     training_loader, validation_loader = fabric.setup_dataloaders(training_loader), fabric.setup_dataloaders(validation_loader)
 
     # ------------------------------------- MODEL, OPTIMIZER AND LOSS/ERROR FUNCTION SETUP -------------------------------------
-    model = Graphformer(args=args)
-    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
-    num_params = sum(p.numel() for p in model_parameters)
-    fabric.print(f'ARCHITECTURE: \n'
-                 f'\tLayers - {args.num_layers} \n'
-                 f'\tMHAs - {args.n_mha} \n'
-                 f'\tALIGNNs - {args.n_alignn} \n'
-                 f'\tGNNs - {args.n_gnn} \n'
-                 f'\tParameters - {num_params}')
+    main_model = Graphformer(args=args)
+    main_model.freeze_pretrain()
+    atom_model = nn.Sequential(Linear(args.hidden_dims, args.num_atom_fea), nn.Sigmoid())
+    main_model, atom_model = fabric.setup_module(main_model), fabric.setup_module(atom_model)
+
+    main_optim = optim.Adam(filter(lambda p: p.requires_grad, main_model.parameters()), lr=args.lr, weight_decay=args.decay)
+    atom_optim = optim.Adam(atom_model.parameters(), lr=args.lr, weight_decay=args.decay)
+    main_optim, atom_optim = fabric.setup_optimizers(main_optim), fabric.setup_optimizers(atom_optim)
 
     if args.load_model == 1:
-        warnings.warn('Pre-Training Strategy not yet Implemented')
-        exit()
-        # model.freeze_train()
+        # Check if there are model checkpoints
+        pt_main_path = osp.join(args.model_path, f'mm_checkpoint.{args.begin_epoch}epochs.ckpt')
+        pt_atom_path = osp.join(args.model_path, f'am_checkpoint.{args.begin_epoch}epochs.ckpt')
+        assert osp.exists(pt_main_path) and osp.exists(pt_atom_path), f'No models checkpoint for epoch {args.begin_epoch} exist in path {str(args.model_path)}'
+        # Load models
+        main_state = {'model': main_model, 'optim_state': main_optim}
+        fabric.load(pt_main_path, state=main_state)
+        atom_state = {'node_model': atom_model, 'node_optim': atom_optim}
+        fabric.load(pt_atom_path, state=atom_state)
 
-    model = fabric.setup_module(model)
+    criterion = nn.BCEWithLogitsLoss()
 
-    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, weight_decay=args.decay)
-    optimizer = fabric.setup_optimizers(optimizer)
-
-    if args.load_model == 1:
-        pretrain_path = osp.join(args.model_path, args.pretrain_model)
-        assert osp.exists(pretrain_path), f'No model save as {args.pretrain_model} exists in path {str(args.model_path)}'
-        state_dicts = {'model': model}
-        fabric.load(pretrain_path, state=state_dicts)
-    elif args.load_model == 2:
-        lowest_path = osp.join(args.model_path, args.lowest_model)
-        assert osp.exists(lowest_path), f'No model save as {args.lowest_model} exists in path {str(args.model_path)}'
-        state_dicts = {'model': model, 'optimizer': optimizer}
-        fabric.load(lowest_path, state=state_dicts)
-
-    train_loss = nn.MSELoss()
-    val_loss = nn.L1Loss()
-
-    # -------------------------------- TRAINING AND VALIDATION --------------------------------
-    fabric.print('-------------------- Training and Validation Started --------------------')
-    lowest_error = 1000000
+    fabric.print('-------------------- Pre-Training Started --------------------', flush=True)
+    lowest_error = np.inf
     per_epoch_times = []
     start_time = time.time()
 
     for epoch in range(args.begin_epoch, args.epochs + 1):
         # -------------------- TRAINING --------------------
         training_start_time = time.time()
-        model, optimizer, epoch_loss = train(args, model, training_loader, optimizer, train_loss, fabric)
+        main_model, atom_model, main_optim, atom_optim, epoch_loss = pre_train(args, training_loader, main_model, atom_model, main_optim, atom_optim, criterion, fabric)
         fabric.print(f'Training time: {time.time() - training_start_time} seconds')
 
         # ------------------- VALIDATION -------------------
         validation_start_time = time.time()
-        epoch_error, epoch_indiv_error = validate(args, model, validation_loader, val_loss, fabric)
+        epoch_error, epoch_accuracy = validate(args, validation_loader, main_model, atom_model, criterion, fabric)
         fabric.print(f'Validation time: {time.time() - validation_start_time} seconds')
 
         # ------------------- LOG RESULTS ------------------
         per_epoch_time = time.time() - training_start_time
+        fabric.print('Completed Epoch %d of %d in %.2f s' % (epoch, args.epochs, per_epoch_time), flush=True)
         per_epoch_times.append(per_epoch_time)
-        fabric.print('Completed Epoch %d of %d in %.2f s' % (epoch, args.epochs, per_epoch_time))
 
-        results = {'Train Loss': epoch_loss, 'Validation Error': epoch_error}
-        if args.out_dims > 1:
-            for i in range(args.out_dims):
-                results[f'{args.out_names[i]} Error'] = epoch_indiv_error[i]
-        fabric.log_dict(results, step=epoch)
+        fabric.log_dict({'Pre-Training Loss': epoch_loss, 'Pre-Training Error': epoch_error, 'Pre-Training Accuracy': epoch_accuracy},  step=epoch)
+
+        # ----------------- CHECKPOINT MODEL ---------------
+        if epoch % 10 == 0:
+            main_state = {'model': main_model, 'optim_state': main_optim}
+            fabric.save(osp.join(args.model_path, f'mm_checkpoint.{epoch}epochs.ckpt'), main_state)
+            atom_state = {'node_model': atom_model, 'node_optim': atom_optim}
+            fabric.save(osp.join(args.model_path, f'am_checkpoint.{epoch}epochs.ckpt'), atom_state)
 
         # ------------- SAVE LOWEST ERROR MODEL ------------
         if epoch_error < lowest_error:
             lowest_error = epoch_error
-            state = {'model': model, 'optimizer': optimizer}
-            fabric.save(osp.join(args.model_path, args.lowest_model), state)
-
-        # ------------------- VISUALIZE -------------------
-        if epoch % 10 == 0 or epoch == 1:
-            model.eval()
-            g, lg, fg, target, _ = next(iter(validation_loader))
-            with torch.no_grad():
-                output, _, _, _, _ = model(g, lg, fg)
+            main_state = {'model': main_model, 'optim_state': main_optim}
+            fabric.save(osp.join(args.model_path, args.pretrain_model), main_state)
 
     fabric.print(f'Average per epoch time: {np.mean(per_epoch_times)} seconds, Total {args.epochs} epochs time: {time.time() - start_time} seconds')
-    fabric.print('-------------------- Training and Validation Finished --------------------')
-
-    state = {'model': model, 'optimizer': optimizer}
-    fabric.save(osp.join(args.model_path, args.final_model), state)
+    fabric.print('-------------------- Pre-Training Finished --------------------')
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Implementation of Training strategy for the Molecular Graph Transformer")
+    parser = argparse.ArgumentParser(description="Implementation of Pre-Training strategy for the Molecular Graph Transformer")
     # Fabric Arguments
     parser.add_argument('--n_devices', type=int, default=8, help='number of gpus/cpus that the code has access to (default: 8)')
     parser.add_argument('--n_nodes', type=int, default=1, help='number of nodes/computers on which the model is being trained (default: 1)')
@@ -210,10 +201,8 @@ if __name__ == "__main__":
     parser.add_argument('--run_name', type=str, default=None, help='name of run for logging purposes')
     parser.add_argument('--save_dir', type=str, default=None, help='directory in which to save the test results')
     parser.add_argument('--pretrain_model', type=str, default='pretrain.ckpt', help='name with which to save the pretrained model')
-    parser.add_argument('--final_model', type=str, default='end_model.ckpt', help='name with which to save the model')
-    parser.add_argument('--lowest_model', type=str, default='lowest.ckpt', help='name with which to save the model with the best performance')
-    parser.add_argument('--load_model', type=int, default=0, choices=[0, 1, 2], help='whether there is a model to be loaded (0: no model loading, 1: load pretrained, 2: load checkpoint)')
-    parser.add_argument('--out_names', nargs='+', type=str, default=None, help='names of the outputs [for logging purposes only]')
+    parser.add_argument('--load_model', type=int, default=0, choices=[0, 1], help='whether there is a model to be loaded (0: no model loading, 1: load checkpoint)')
+    parser.add_argument('--n_ckpt', type=int, default=10, help='number of epochs to wait before saving a checkpoint of the model (default: 10)')
     # Training Arguments
     parser.add_argument('--n_cum', type=int, default=8, help='number of batches to accumulate the error for')
     parser.add_argument('--batch_size', type=int, default=2, help='batch size for training (default: 2)')
@@ -223,7 +212,7 @@ if __name__ == "__main__":
     parser.add_argument('--begin_epoch', type=int, default=1, help='set to restart training from a specific epoch')
     parser.add_argument('--lr', type=float, default=0.0001, help='learning rate (default: 0.0001)')
     parser.add_argument('--decay', type=float, default=1e-5, help='weight decay for the optimizers (default: 1e-5)')
-    # Model and Dataset Arguments
+    # Model Arguments
     parser.add_argument('--process', type=int, default=1, choices=[0, 1], help='whether the graphs for the structures/molecules need to be created during dataset loading (default: True)')
     parser.add_argument('--max_nei_num', type=int, default=12, help='maximum number of neighbour allowed for each atom in the local graph (default: 12)')
     parser.add_argument('--local_radius', type=int, default=8, help='radius used to form the local graph (default: 8)')
@@ -246,20 +235,16 @@ if __name__ == "__main__":
     parser.add_argument('--n_gnn', type=int, default=3, help='number of graph convolutions in each encoder (default: 3)')
     parser.add_argument('--n_heads', type=int, default=4, help='number of attention heads (default: 4)')
     parser.add_argument('--residual', type=int, default=1, choices=[0, 1], help='whether to add residuality to the network or not (default: True)')
+    parser.add_argument('--mask_rate', type=float, default=0.2, help='percentage of node to be masked (default: 0.2)')
 
     args = parser.parse_args()
 
-    if args.out_names is None:
-        args.out_names = []
-        for i in range(args.out_dims):
-            args.out_names.append(str(i + 1))
-    assert len(args.out_names) == args.out_dims, 'number of outputs and output names not the same'
     args.residual = bool(args.residual)
     args.periodic = bool(args.periodic)
     args.process = bool(args.process)
 
     if args.save_dir is None:
-        args.save_dir = osp.join(os.getcwd(), 'output', 'train')
+        args.save_dir = osp.join(os.getcwd(), 'output', 'pre-train')
         if not osp.exists(args.save_dir):
             directory = pathlib.Path(args.save_dir)
             directory.mkdir(parents=True, exist_ok=True)

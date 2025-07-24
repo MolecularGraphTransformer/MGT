@@ -91,7 +91,7 @@ def main(args):
 
     saved_model = osp.join(args.model_path, args.model_name)
     assert osp.exists(saved_model), f'No model save as {args.model_name} exists in path {str(args.model_path)}'
-    state_dicts = {'models': model}
+    state_dicts = {'model': model}
     fabric.load(saved_model, state=state_dicts)
 
     criterion = nn.L1Loss()

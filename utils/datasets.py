@@ -257,30 +257,15 @@ class StructureDataset(torch.utils.data.Dataset):
             return batched_graph, batched_line_graph, batched_full_graph, torch.tensor(labels), ids
 
     @staticmethod
-    def collate_pre(samples: List[Tuple[Tuple, dgl.DGLGraph, dgl.DGLGraph, torch.Tensor]]):
-        graphs, line_graphs, full_graphs = map(list, zip(*samples))
-        if len(samples[0][0]) == 2:
-            graphs, nodes_sub, line_graphs, full_graphs = map(list, zip(*samples))
-            cum_n = 0
-            for i, g in enumerate(graphs):
-                nodes_sub[i].ndata[dgl.NID] = nodes_sub[i].ndata[dgl.NID] + cum_n
-                cum_n += g.num_nodes()
-            batched_graph = dgl.batch(graphs)
-            batched_nodes = dgl.batch(nodes_sub)
-            batched_line_graph = dgl.batch(line_graphs)
-            batched_full_graph = dgl.batch(full_graphs)
-            return (batched_graph, batched_nodes), batched_line_graph, batched_full_graph
-        else:
-            graphs, nodes_sub, edges_sub = [s[0][0] for s in samples], [s[0][1] for s in samples], [s[0][2] for s in samples]
-            cum_n, cum_e = 0, 0
-            for i, g in enumerate(graphs):
-                nodes_sub[i].ndata[dgl.NID] = nodes_sub[i].ndata[dgl.NID] + cum_n
-                edges_sub[i].edata[dgl.EID] = edges_sub[i].edata[dgl.EID] + cum_e
-                cum_n += g.num_nodes()
-                cum_e += g.num_edges()
-            batched_graph = dgl.batch(graphs)
-            batched_nodes = dgl.batch(nodes_sub)
-            batched_edges = dgl.batch(edges_sub)
-            batched_line_graph = dgl.batch(line_graphs)
-            batched_full_graph = dgl.batch(full_graphs)
-            return (batched_graph, batched_nodes, batched_edges), batched_line_graph, batched_full_graph
+    def collate_pre(samples: List[Tuple[Tuple, dgl.DGLGraph, dgl.DGLGraph, str]]):
+        graphs, line_graphs, full_graphs, ids = map(list, zip(*samples))
+        graphs, nodes_sub = map(list, zip(*graphs))
+        cum_n = 0
+        for i, g in enumerate(graphs):
+            nodes_sub[i].ndata[dgl.NID] = nodes_sub[i].ndata[dgl.NID] + cum_n
+            cum_n += g.num_nodes()
+        batched_graph = dgl.batch(graphs)
+        batched_nodes = dgl.batch(nodes_sub)
+        batched_line_graph = dgl.batch(line_graphs)
+        batched_full_graph = dgl.batch(full_graphs)
+        return (batched_graph, batched_nodes), batched_line_graph, batched_full_graph, ids
